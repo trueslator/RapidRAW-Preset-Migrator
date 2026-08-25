@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """RapidRAW Preset Migrator 1.0.0.
 
-Converts legacy Lightroom .lrtemplate presets once, then lets the local HTML
+Converts Lightroom .lrtemplate and .xmp presets once, then lets the local HTML
 manager discover user-owned DCP files dynamically from CameraProfiles/.
 Companion LUTs are generated only when a matching profile is selected.
 No third-party Python packages required.
@@ -128,14 +128,14 @@ def convert_migration(input_path:str,output_dir:str,template_path=None,dcp_path=
     """Convert legacy presets once; CameraProfiles remain a live manager-side library.
 
     No DCP is permanently chosen here.  This is intentional: users can add, remove or
-    switch their own .dcp files later without converting the .lrtemplate collection again.
+    switch their own .dcp files later without converting the Lightroom preset collection again.
     """
     out=pathlib.Path(output_dir); out.mkdir(parents=True,exist_ok=True)
     fallback_dir=out/'Presets_Fallback'; fallback_dir.mkdir(exist_ok=True)
     results,errors,_=core.convert_all(input_path,str(fallback_dir),template_path,True,True,progress)
     parsed_by_source={}
     for rel,text in core.iter_inputs(input_path):
-        try: parsed_by_source[rel]=core.parse_lrtemplate(text,rel)
+        try: parsed_by_source[rel]=core.parse_lightroom_preset(text,rel)
         except Exception: pass
     prep={res.source:dcp_prep_metadata(parsed_by_source.get(res.source)) for res in results}
     (out/'migration_dcp_prep.json').write_text(json.dumps(prep,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -170,6 +170,7 @@ def convert_migration(input_path:str,output_dir:str,template_path=None,dcp_path=
     summary={'input':input_path,'presets':len(results),'conversion_errors':len(errors),'external_camera_profile_references':external,
              'builtin_profile_references':builtin,'unique_external_camera_profiles':len(counts),'camera_profiles_seeded':copied,
              'camera_profiles_seed_duplicates':skipped,'camera_profile_copy_errors':len(dcp_copy_errors),'lut_grid':grid,
+             'formats':dict(sorted(collections.Counter(pathlib.Path(r.source).suffix.lower().lstrip('.') for r in results).items())),
              'dcp_strategy':'CameraProfiles are selected dynamically in the HTML manager; companion LUTs are generated on demand.',
              'color_recipe':'DCP creative color tables + tone curve, applied as a subtle 1% companion LUT.',
              'bw_recipe':'DCP creative color tables 25% + Lightroom GrayMixer -> B&W + DCP tone curve 1%.',
@@ -185,8 +186,11 @@ def make_gui():
     frm=ttk.Frame(root,padding=12); frm.pack(fill='both',expand=True)
     inp=tk.StringVar(); out=tk.StringVar(); dcp=tk.StringVar(); tmpl=tk.StringVar(); cam=tk.StringVar(value='Auto')
     def pick_input():
-        f=filedialog.askopenfilename(title='ZIP mit Templates (und optional CameraProfile) wählen',filetypes=[('ZIP','*.zip'),('Alle','*.*')])
+        f=filedialog.askopenfilename(title='Lightroom-Presets (.lrtemplate/.xmp) oder ZIP wählen',filetypes=[('Lightroom/ZIP','*.zip *.lrtemplate *.xmp'),('Alle','*.*')])
         if f: inp.set(f); out.set(str(pathlib.Path(f).with_name(pathlib.Path(f).stem+'_RapidRAW_Migrated')))
+    def pick_input_folder():
+        f=filedialog.askdirectory(title='Ordner mit Lightroom-Presets wählen')
+        if f: inp.set(f); out.set(str(pathlib.Path(f).with_name(pathlib.Path(f).name+'_RapidRAW_Migrated')))
     def pick_dcp():
         f=filedialog.askdirectory(title='Optional: separater Ordner mit DCP-Dateien')
         if f: dcp.set(f)
@@ -197,7 +201,7 @@ def make_gui():
         f=filedialog.askopenfilename(title='Optionales frisches RapidRAW Test-Preset',filetypes=[('RapidRAW','*.rrpreset'),('Alle','*.*')]);
         if f: tmpl.set(f)
     ttk.Label(frm,text=f'{APP_NAME} {APP_VERSION}',font=('Segoe UI',16,'bold')).grid(row=0,column=0,columnspan=4,sticky='w',pady=(0,12))
-    ttk.Label(frm,text='Templates ZIP:').grid(row=1,column=0,sticky='w'); ttk.Entry(frm,textvariable=inp).grid(row=1,column=1,sticky='ew',padx=6); ttk.Button(frm,text='Wählen…',command=pick_input).grid(row=1,column=2)
+    ttk.Label(frm,text='Lightroom-Presets:').grid(row=1,column=0,sticky='w'); ttk.Entry(frm,textvariable=inp).grid(row=1,column=1,sticky='ew',padx=6); ttk.Button(frm,text='Datei/ZIP…',command=pick_input).grid(row=1,column=2); ttk.Button(frm,text='Ordner…',command=pick_input_folder).grid(row=1,column=3,padx=(6,0))
     ttk.Label(frm,text='DCP-Ordner optional:').grid(row=2,column=0,sticky='w',pady=5); ttk.Entry(frm,textvariable=dcp).grid(row=2,column=1,sticky='ew',padx=6); ttk.Button(frm,text='Wählen…',command=pick_dcp).grid(row=2,column=2)
     ttk.Label(frm,text='Ausgabe:').grid(row=3,column=0,sticky='w'); ttk.Entry(frm,textvariable=out).grid(row=3,column=1,sticky='ew',padx=6); ttk.Button(frm,text='Wählen…',command=pick_out).grid(row=3,column=2)
     ttk.Label(frm,text='CameraProfiles optional vorbefüllen:').grid(row=4,column=0,sticky='w',pady=5); ttk.Label(frm,text='DCPs können auch später einfach in CameraProfiles/ kopiert werden.').grid(row=4,column=1,columnspan=2,sticky='w',padx=6)
@@ -207,7 +211,7 @@ def make_gui():
     log=tk.Text(frm,height=22,wrap='word'); log.grid(row=8,column=0,columnspan=4,sticky='nsew',pady=(8,0))
     frm.columnconfigure(1,weight=1); frm.rowconfigure(8,weight=1)
     def run():
-        if not inp.get() or not out.get(): messagebox.showerror('Fehlt','Bitte Templates-ZIP und Ausgabe wählen.'); return
+        if not inp.get() or not out.get(): messagebox.showerror('Fehlt','Bitte Lightroom-Presets/ZIP und Ausgabe wählen.'); return
         log.delete('1.0','end')
         def prog(i,n,name):
             pb['maximum']=max(n,1); pb['value']=i
@@ -224,8 +228,8 @@ def make_gui():
 def main(argv=None):
     argv=sys.argv[1:] if argv is None else argv
     if not argv: return make_gui()
-    ap=argparse.ArgumentParser(description=f'{APP_NAME} {APP_VERSION}: DCP-aware legacy Lightroom preset migration with cross-platform HTML manager')
-    ap.add_argument('input',help='Templates folder/ZIP; DCPs inside are auto-detected')
+    ap=argparse.ArgumentParser(description=f'{APP_NAME} {APP_VERSION}: Lightroom .lrtemplate/.xmp migration with DCP-aware cross-platform HTML manager')
+    ap.add_argument('input',help='Lightroom .lrtemplate/.xmp file, folder, or ZIP; DCPs inside are auto-detected')
     ap.add_argument('-o','--output',default='RapidRAW_Migrated_Presets')
     ap.add_argument('--dcp',help='Optional additional DCP folder/ZIP/file')
     ap.add_argument('--template',help='Optional fresh RapidRAW .rrpreset schema')

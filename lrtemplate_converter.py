@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RapidRAW Preset Migrator: legacy Lightroom .lrtemplate -> RapidRAW .rrpreset converter
+RapidRAW Preset Migrator: Lightroom .lrtemplate/.xmp -> RapidRAW .rrpreset converter
 Compatible with the RapidRAW preset schema tested through RapidRAW v1.6.2 (2026-08-25).
 Standard-library only; works as GUI or CLI.
 
@@ -17,7 +17,7 @@ Optional: supply a fresh RapidRAW preset exported by your installed version:
 The converter then uses that preset's adjustment structure as its baseline.
 """
 from __future__ import annotations
-import argparse, copy, csv, io, json, math, os, pathlib, re, shutil, sys, tempfile, uuid, zipfile
+import argparse, copy, csv, io, json, math, os, pathlib, re, shutil, sys, tempfile, uuid, zipfile, xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -31,6 +31,13 @@ COLOR_MAP = {
     'Aqua':'aquas','Blue':'blues','Purple':'purples','Magenta':'magentas'
 }
 
+# Empirical cross-engine approximation constants. RapidRAW and Adobe Camera Raw
+# do not interpret every slider identically; these are intentionally documented
+# as best-effort mappings, not 1:1 conversions.
+XMP_CALIBRATION_SCALE = 0.55
+RAPIDRAW_WB_MIREDS_AT_FULL_SCALE = 150.0
+RAPIDRAW_TINT_SCALE = 1.5
+
 METADATA_KEYS = {
     'EnableCalibration','EnableColorAdjustments','EnableDetail','EnableEffects',
     'EnableGradientBasedCorrections','EnableCircularGradientBasedCorrections',
@@ -38,6 +45,10 @@ METADATA_KEYS = {
     'ToneCurveName2012','ToneCurveName','ProcessVersion','CameraProfile','WhiteBalance',
     'AutoBrightness','AutoContrast','AutoExposure','AutoShadows','AutoTone','orientation',
     'LensProfileSetup','LensProfileEnable','CropConstrainToWarp',
+    'Version','PresetType','UUID','HasSettings','Copyright','CameraProfileDigest',
+    'SupportsAmount','SupportsColor','SupportsMonochrome','SupportsHighDynamicRange',
+    'SupportsNormalDynamicRange','SupportsOutputReferred','SupportsSceneReferred',
+    'OverrideLookVignette','ShortName','SortName','Group','Description','AsShotTemperature','AsShotTint',
 }
 
 UNSUPPORTED_ALWAYS = {
@@ -54,6 +65,8 @@ class ParsedPreset:
     name: str
     settings: Dict[str, Any]
     arrays: Dict[str, List[float]]
+    source_format: str = "lrtemplate"
+    features: List[str] = field(default_factory=list)
 
 @dataclass
 class ConversionResult:
@@ -136,7 +149,82 @@ def parse_lrtemplate(text: str, source: str) -> ParsedPreset:
         k=m.group(1); raw=m.group(2)
         if '{' in raw or '}' in raw: continue
         settings[k]=_parse_value(raw)
-    return ParsedPreset(source=source,name=name,settings=settings,arrays=arrays)
+    return ParsedPreset(source=source,name=name,settings=settings,arrays=arrays,source_format="lrtemplate")
+
+CRS_NS = "http://ns.adobe.com/camera-raw-settings/1.0/"
+RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+
+def _xml_local(tag: str) -> str:
+    return tag.rsplit('}', 1)[-1] if '}' in tag else tag.split(':')[-1]
+
+def _xmp_scalar(raw: str) -> Any:
+    raw=(raw or '').strip()
+    low=raw.lower()
+    if low in ('true','false'): return low=='true'
+    try:
+        if re.fullmatch(r'[-+]?\d+', raw): return int(raw)
+        if re.fullmatch(r'[-+]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][-+]?\d+)?', raw): return float(raw)
+    except Exception: pass
+    return raw
+
+def parse_xmp(text: str, source: str) -> ParsedPreset:
+    try:
+        root=ET.fromstring(text.lstrip('\ufeff'))
+    except ET.ParseError as e:
+        raise ValueError(f'Invalid XMP/XML: {e}') from e
+    descriptions=[]
+    for el in root.iter():
+        if _xml_local(el.tag)=='Description':
+            attrs={_xml_local(k):v for k,v in el.attrib.items() if k.startswith('{'+CRS_NS+'}')}
+            if attrs: descriptions.append((len(attrs),el,attrs))
+    if not descriptions: raise ValueError('No Camera Raw settings found in XMP')
+    _,desc,attrs=max(descriptions,key=lambda x:x[0])
+    settings={k:_xmp_scalar(v) for k,v in attrs.items()}
+    arrays={}
+    features=[]
+    name=str(settings.get('Name') or pathlib.Path(source).stem)
+    for child in list(desc):
+        lname=_xml_local(child.tag)
+        if lname=='Name':
+            vals=[(li.text or '').strip() for li in child.iter() if _xml_local(li.tag)=='li' and (li.text or '').strip()]
+            if vals: name=vals[0]
+        elif lname.startswith('ToneCurve'):
+            vals=[]
+            for li in child.iter():
+                if _xml_local(li.tag)!='li' or not (li.text or '').strip(): continue
+                nums=re.findall(r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?',li.text or '')
+                if len(nums)>=2:
+                    vals.extend(float(x) if any(c in x for c in '.eE') else int(x) for x in nums[:2])
+            if vals: arrays[lname]=vals
+        elif lname in ('Masking','GradientBasedCorrections','CircularGradientBasedCorrections','PaintBasedCorrections','RetouchAreas'):
+            features.append('Masking/local adjustments')
+        elif lname in ('PointColors','PointColorCorrections'):
+            nums=[]
+            for li in child.iter():
+                if _xml_local(li.tag)=='li' and (li.text or '').strip():
+                    nums.extend(float(x) for x in re.findall(r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?', li.text or ''))
+            # Adobe often writes an all -1 placeholder even when Point Color is unused.
+            if nums and any(abs(v + 1.0) > 1e-9 for v in nums):
+                features.append('Point Color adjustments')
+        elif lname=='Look':
+            look_name=child.attrib.get('{'+CRS_NS+'}Name','').strip()
+            look_desc=next((e for e in child.iter() if _xml_local(e.tag)=='Description'),None)
+            if look_desc is not None:
+                look_name=look_desc.attrib.get('{'+CRS_NS+'}Name',look_name).strip()
+            if look_name and look_name not in ('Adobe Color','Adobe Monochrome'):
+                features.append('Creative XMP profile/look: '+look_name)
+    # Some newer presets expose local/adaptive structures deeper in the tree.
+    all_names={_xml_local(e.tag) for e in root.iter()}
+    if {'Masking','Masks','MaskGroup'} & all_names and 'Masking/local adjustments' not in features:
+        features.append('Masking/local adjustments')
+    if any(k.startswith('Mask') or k.startswith('Semantic') for k in settings):
+        features.append('Adaptive/AI mask metadata')
+    if settings.get('LensProfileEnable') in (1, True) or settings.get('AutoLateralCA') in (1, True):
+        features.append('Lens profile/correction settings')
+    return ParsedPreset(source=source,name=name,settings=settings,arrays=arrays,source_format='xmp',features=sorted(set(features)))
+
+def parse_lightroom_preset(text: str, source: str) -> ParsedPreset:
+    return parse_xmp(text, source) if pathlib.Path(source).suffix.lower()=='.xmp' else parse_lrtemplate(text, source)
 
 
 def neutralize_baseline(a: Dict[str,Any]) -> Dict[str,Any]:
@@ -216,7 +304,7 @@ def convert(parsed:ParsedPreset, baseline:Dict[str,Any]) -> ConversionResult:
     direct={
         'Exposure2012':('exposure',),'Contrast2012':('contrast',),'Highlights2012':('highlights',),
         'Whites2012':('whites',),'Blacks2012':('blacks',),'Clarity2012':('clarity',),
-        'Dehaze':('dehaze',),'Vibrance':('vibrance',),'Saturation':('saturation',),
+        'Dehaze':('dehaze',),'Vibrance':('vibrance',),'Saturation':('saturation',),'Texture':('structure',),
         'ColorNoiseReduction':('colorNoiseReduction',),'LuminanceSmoothing':('lumaNoiseReduction',),
     }
     for k,p in direct.items():
@@ -259,12 +347,21 @@ def convert(parsed:ParsedPreset, baseline:Dict[str,Any]) -> ConversionResult:
             if gv is not None: setv(a,('hsl',dst_color,'luminance'),gv,r,'GrayMixer'+src_color,True)
         r.warnings.append('B&W converted via Saturation -100 + HSL luminance mixer; DCP-aware LUT conversion can be closer for film profiles.')
 
-    # Calibration (present in current RapidRAW schema)
+    # Camera Calibration. Legacy .lrtemplate values were validated close to 1:1.
+    # Modern XMP calibration controls are stronger than RapidRAW's current
+    # equivalents in our cross-engine A/B tests, so use a conservative scale.
     calmap={'RedHue':'redHue','RedSaturation':'redSaturation','GreenHue':'greenHue','GreenSaturation':'greenSaturation',
             'BlueHue':'blueHue','BlueSaturation':'blueSaturation','ShadowTint':'shadowsTint'}
+    cal_scale = XMP_CALIBRATION_SCALE if parsed.source_format == 'xmp' else 1.0
+    cal_scaled = False
     for sk,dk in calmap.items():
         v=num(s,sk)
-        if v is not None: setv(a,('colorCalibration',dk),v,r,sk)
+        if v is not None:
+            scaled=v*cal_scale
+            setv(a,('colorCalibration',dk),scaled,r,sk,approx=(cal_scale != 1.0 and abs(v) > 1e-12))
+            if cal_scale != 1.0 and abs(v) > 1e-12: cal_scaled=True
+    if cal_scaled:
+        r.warnings.append(f'XMP Camera Calibration scaled to {XMP_CALIBRATION_SCALE:.0%} as a cross-engine approximation; Lightroom and RapidRAW are not 1:1.')
 
     # Split toning -> color grading
     cg={'SplitToningBalance':('balance',),
@@ -273,11 +370,23 @@ def convert(parsed:ParsedPreset, baseline:Dict[str,Any]) -> ConversionResult:
     for sk,tail in cg.items():
         v=num(s,sk)
         if v is not None: setv(a,('colorGrading',)+tail,v,r,sk)
+    modern_cg={
+        'ColorGradeShadowHue':('shadows','hue'),'ColorGradeShadowSat':('shadows','saturation'),'ColorGradeShadowLum':('shadows','luminance'),
+        'ColorGradeMidtoneHue':('midtones','hue'),'ColorGradeMidtoneSat':('midtones','saturation'),'ColorGradeMidtoneLum':('midtones','luminance'),
+        'ColorGradeHighlightHue':('highlights','hue'),'ColorGradeHighlightSat':('highlights','saturation'),'ColorGradeHighlightLum':('highlights','luminance'),
+        'ColorGradeGlobalHue':('global','hue'),'ColorGradeGlobalSat':('global','saturation'),'ColorGradeGlobalLum':('global','luminance'),
+        'ColorGradeBlending':('blending',),'ColorGradeBalance':('balance',),
+    }
+    for sk,tail in modern_cg.items():
+        v=num(s,sk)
+        if v is not None: setv(a,('colorGrading',)+tail,v,r,sk)
 
     # Grain
     for sk,dk in [('GrainAmount','grainAmount'),('GrainSize','grainSize'),('GrainFrequency','grainRoughness')]:
         v=num(s,sk)
         if v is not None: setv(a,(dk,),v,r,sk)
+    if num(s,'GrainFrequency') is None and num(s,'GrainRoughness') is not None:
+        setv(a,('grainRoughness',),num(s,'GrainRoughness'),r,'GrainRoughness')
 
     # Sharpness: amount and masking only exist in sampled schema
     v=num(s,'Sharpness')
@@ -288,13 +397,19 @@ def convert(parsed:ParsedPreset, baseline:Dict[str,Any]) -> ConversionResult:
     if num(s,'SharpenEdgeMasking') not in (None,0):
         r.unsupported.append('SharpenEdgeMasking')
 
-    # Vignette: prefer post-crop variant
+    # Only Lightroom's Post-Crop Vignette maps reasonably to RapidRAW's creative
+    # vignette. Lightroom VignetteAmount is a lens/manual correction control and
+    # produced a very wrong result when mapped 1:1 in cross-engine validation.
     vig=num(s,'PostCropVignetteAmount')
-    if vig is None: vig=num(s,'VignetteAmount')
-    if vig is not None: setv(a,('vignetteAmount',),vig,r,'PostCropVignetteAmount' if 'PostCropVignetteAmount' in s else 'VignetteAmount')
-    for sk,dk in [('PostCropVignetteMidpoint','vignetteMidpoint'),('PostCropVignetteFeather','vignetteFeather'),('PostCropVignetteRoundness','vignetteRoundness')]:
-        v=num(s,sk)
-        if v is not None: setv(a,(dk,),v,r,sk)
+    if vig is not None:
+        setv(a,('vignetteAmount',),vig,r,'PostCropVignetteAmount')
+        for sk,dk in [('PostCropVignetteMidpoint','vignetteMidpoint'),('PostCropVignetteFeather','vignetteFeather'),('PostCropVignetteRoundness','vignetteRoundness')]:
+            v=num(s,sk)
+            if v is not None: setv(a,(dk,),v,r,sk)
+    manual_vig=num(s,'VignetteAmount')
+    if manual_vig not in (None,0):
+        r.unsupported.append('VignetteAmount')
+        r.warnings.append('Lightroom lens/manual VignetteAmount was not mapped to RapidRAW creative vignette; they are not equivalent.')
 
     # Chromatic aberration legacy approximation
     v=num(s,'ChromaticAberrationR')
@@ -302,49 +417,99 @@ def convert(parsed:ParsedPreset, baseline:Dict[str,Any]) -> ConversionResult:
     v=num(s,'ChromaticAberrationB')
     if v is not None: setv(a,('chromaticAberrationBlueYellow',),v,r,'ChromaticAberrationB',True)
 
-    # Curves: PV2012 or legacy luma
+    # Curves. RapidRAW renders one curve mode at a time. If Lightroom contains
+    # meaningful parametric tone adjustments, prefer that mode and explicitly
+    # neutralize point curves. This avoids silently keeping a point curve while
+    # ignoring ParametricDarks/Shadows/Lights/Highlights.
     ckeys={'ToneCurvePV2012':'luma','ToneCurvePV2012Red':'red','ToneCurvePV2012Green':'green','ToneCurvePV2012Blue':'blue'}
-    any_curve=False
+    parsed_point_curves={}
     for sk,dk in ckeys.items():
-        vals=parsed.arrays.get(sk); pts=curve_points(vals or [])
-        if pts and 'curves' in a and dk in a['curves']:
-            a['curves'][dk]=copy.deepcopy(pts)
-            if 'pointCurves' in a and dk in a['pointCurves']: a['pointCurves'][dk]=copy.deepcopy(pts)
-            r.mapped.append(sk); any_curve=True
-    if not any_curve:
+        pts=curve_points(parsed.arrays.get(sk) or [])
+        if pts: parsed_point_curves[sk]=(dk,pts)
+    if not parsed_point_curves:
         pts=curve_points(parsed.arrays.get('ToneCurve',[]))
-        if pts and 'curves' in a and 'luma' in a['curves']:
-            a['curves']['luma']=copy.deepcopy(pts)
-            if 'pointCurves' in a and 'luma' in a['pointCurves']: a['pointCurves']['luma']=copy.deepcopy(pts)
-            r.approximate.append('ToneCurve (legacy)'); any_curve=True
-    if any_curve and 'curveMode' in a: a['curveMode']='point'
+        if pts: parsed_point_curves['ToneCurve'] = ('luma',pts)
 
-    # Parametric curve: current schema exposes it, so preserve it as well.
-    if 'parametricCurve' in a and 'luma' in a['parametricCurve']:
+    param_value_keys=('ParametricDarks','ParametricHighlights','ParametricLights','ParametricShadows')
+    meaningful_parametric=any(abs(num(s,k,0) or 0)>1e-12 for k in param_value_keys)
+
+    if meaningful_parametric and 'parametricCurve' in a and 'luma' in a['parametricCurve']:
         pcm={'ParametricDarks':'darks','ParametricHighlights':'highlights','ParametricLights':'lights','ParametricShadows':'shadows',
              'ParametricShadowSplit':'split1','ParametricMidtoneSplit':'split2','ParametricHighlightSplit':'split3'}
         for sk,dk in pcm.items():
             v=num(s,sk)
             if v is not None:
                 a['parametricCurve']['luma'][dk]=v; r.mapped.append(sk)
+        identity=[{'x':0,'y':0},{'x':255,'y':255}]
+        for container in ('curves','pointCurves'):
+            if isinstance(a.get(container),dict):
+                for ch in a[container]: a[container][ch]=copy.deepcopy(identity)
+        if 'curveMode' in a: a['curveMode']='parametric'
+        if parsed_point_curves:
+            omitted=[]
+            for sk,(dk,pts) in parsed_point_curves.items():
+                # Identity RGB curves do not meaningfully conflict, so only report
+                # curves that actually change the image.
+                changed=any(abs(float(pt['y'])-float(pt['x']))>1e-9 for pt in pts)
+                if changed:
+                    omitted.append(sk)
+                    if sk not in r.unsupported: r.unsupported.append(sk+' (point curve omitted; parametric mode selected)')
+            if omitted:
+                r.warnings.append('Lightroom contains both point and parametric tone curves. RapidRAW renders one curve mode; parametric tone curve was selected and non-neutral point curve data was omitted.')
+    else:
+        any_curve=False
+        for sk,(dk,pts) in parsed_point_curves.items():
+            if 'curves' in a and dk in a['curves']:
+                a['curves'][dk]=copy.deepcopy(pts)
+                if 'pointCurves' in a and dk in a['pointCurves']: a['pointCurves'][dk]=copy.deepcopy(pts)
+                (r.approximate if sk=='ToneCurve' else r.mapped).append(sk if sk!='ToneCurve' else 'ToneCurve (legacy)')
+                any_curve=True
+        if any_curve and 'curveMode' in a: a['curveMode']='point'
+        # Preserve neutral/non-meaningful parametric splits in the data for reporting,
+        # but do not activate parametric mode unless tone values are non-zero.
+        if 'parametricCurve' in a and 'luma' in a['parametricCurve']:
+            pcm={'ParametricDarks':'darks','ParametricHighlights':'highlights','ParametricLights':'lights','ParametricShadows':'shadows',
+                 'ParametricShadowSplit':'split1','ParametricMidtoneSplit':'split2','ParametricHighlightSplit':'split3'}
+            for sk,dk in pcm.items():
+                v=num(s,sk)
+                if v is not None:
+                    a['parametricCurve']['luma'][dk]=v; r.mapped.append(sk)
 
-    # Absolute legacy WB does not map safely to RapidRAW's relative control.
-    for k in ('Temperature','Tint','IncrementalTemperature','IncrementalTint'):
-        if k in s and num(s,k) not in (None,0):
-            r.unsupported.append(k)
-    if any(k in r.unsupported for k in ('Temperature','Tint','IncrementalTemperature','IncrementalTint')):
-        r.warnings.append('Legacy white-balance temperature/tint was not applied because RapidRAW stores a relative WB adjustment.')
+    # White balance. Modern XMP often stores both the target WB and As-Shot WB.
+    # RapidRAW uses a relative +/- control, so convert the Kelvin change to mireds
+    # and the tint delta to RapidRAW's current scale. This is an approximation.
+    wb_done=False
+    target_temp=num(s,'Temperature'); as_temp=num(s,'AsShotTemperature')
+    if parsed.source_format=='xmp' and target_temp and as_temp and target_temp>0 and as_temp>0:
+        rr_temp=((1_000_000.0/as_temp)-(1_000_000.0/target_temp))/RAPIDRAW_WB_MIREDS_AT_FULL_SCALE*100.0
+        if setv(a,('temperature',),clamp(rr_temp,-100,100),r,'Temperature (relative from AsShot)',True): wb_done=True
+    target_tint=num(s,'Tint'); as_tint=num(s,'AsShotTint')
+    if parsed.source_format=='xmp' and target_tint is not None and as_tint is not None:
+        rr_tint=(target_tint-as_tint)/RAPIDRAW_TINT_SCALE
+        if setv(a,('tint',),clamp(rr_tint,-100,100),r,'Tint (relative from AsShot)',True): wb_done=True
+    if wb_done:
+        r.warnings.append('White balance converted from Lightroom absolute/As-Shot values to RapidRAW relative controls; result is an approximation, not 1:1.')
+    else:
+        for k in ('Temperature','Tint','IncrementalTemperature','IncrementalTint'):
+            if k in s and num(s,k) not in (None,0):
+                r.unsupported.append(k)
+        if any(k in r.unsupported for k in ('Temperature','Tint','IncrementalTemperature','IncrementalTint')):
+            r.warnings.append('White-balance values could not be safely converted because matching As-Shot values were unavailable.')
 
     if r.camera_profile and r.camera_profile not in ('Adobe Standard','Embedded','ACR 2.4','ACR 3.3','ACR 3.4','ACR 4.4'):
         r.warnings.append('CameraProfile not embedded: '+r.camera_profile)
+    for feature in parsed.features:
+        r.unsupported.append(feature)
+        r.warnings.append('XMP feature not migrated: '+feature)
 
     # Find meaningful leftovers. Ignore zeros/default-ish metadata.
     handled=set(r.mapped)|set(r.approximate)|METADATA_KEYS|UNSUPPORTED_ALWAYS|{'ConvertToGrayscale'}
+    handled.update({'Temperature','Tint','AsShotTemperature','AsShotTint'})
     # normalize approximate label for legacy Shadows
     handled.add('Shadows')
     for k,v in s.items():
         if k in handled: continue
-        if k.startswith('Enable') or k.startswith('Auto'): continue
+        if k.startswith('Enable') or k.startswith('Auto') or k.startswith('Supports'): continue
         meaningful = (isinstance(v,bool) and v) or (isinstance(v,(int,float)) and abs(v)>1e-12) or (isinstance(v,str) and v not in ('','0','None'))
         if meaningful and k not in r.unsupported:
             r.unsupported.append(k)
@@ -368,18 +533,19 @@ def safe_name(name:str)->str:
 
 def iter_inputs(input_path:str) -> Iterable[Tuple[str,str]]:
     p=pathlib.Path(input_path)
+    supported={'.lrtemplate','.xmp'}
     if p.is_dir():
-        for f in sorted(p.rglob('*.lrtemplate')):
+        for f in sorted((x for x in p.rglob('*') if x.is_file() and x.suffix.lower() in supported), key=lambda x:str(x).casefold()):
             yield str(f.relative_to(p)).replace('\\','/'), f.read_text(encoding='utf-8',errors='replace')
     elif p.is_file() and p.suffix.lower()=='.zip':
         with zipfile.ZipFile(p) as z:
             for n in sorted(z.namelist()):
-                if n.lower().endswith('.lrtemplate') and not n.endswith('/'):
+                if pathlib.PurePosixPath(n).suffix.lower() in supported and not n.endswith('/'):
                     yield n, z.read(n).decode('utf-8',errors='replace')
-    elif p.is_file() and p.suffix.lower()=='.lrtemplate':
+    elif p.is_file() and p.suffix.lower() in supported:
         yield p.name, p.read_text(encoding='utf-8',errors='replace')
     else:
-        raise ValueError('Input must be a .lrtemplate file, a folder, or a ZIP containing .lrtemplate files.')
+        raise ValueError('Input must be a .lrtemplate or .xmp file, a folder, or a ZIP containing Lightroom presets.')
 
 
 def convert_all(input_path:str, output_dir:str, template_path:Optional[str]=None, individual=True, combined=True, progress=None):
@@ -389,29 +555,29 @@ def convert_all(input_path:str, output_dir:str, template_path:Optional[str]=None
     items=list(iter_inputs(input_path))
     for idx,(rel,text) in enumerate(items,1):
         try:
-            parsed=parse_lrtemplate(text,rel); res=convert(parsed,baseline); results.append(res)
+            parsed=parse_lightroom_preset(text,rel); res=convert(parsed,baseline); results.append(res)
             if individual:
                 relp=pathlib.PurePosixPath(rel)
                 parent=out.joinpath(*relp.parts[:-1]); parent.mkdir(parents=True,exist_ok=True)
-                fn=safe_name(pathlib.Path(relp.name).stem)+'.rrpreset'
-                data={'creator':'Converted from legacy Lightroom lrtemplate','presets':[res.preset_entry]}
+                fn=safe_name(pathlib.Path(relp.name).stem)+('__xmp' if pathlib.Path(relp.name).suffix.lower()=='.xmp' else '')+'.rrpreset'
+                data={'creator':'Converted from Lightroom '+parsed.source_format,'presets':[res.preset_entry]}
                 (parent/fn).write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
         except Exception as e:
             errors.append((rel,str(e)))
         if progress: progress(idx,len(items),rel)
     if combined and results:
-        data={'creator':'Legacy Lightroom batch conversion','presets':[r.preset_entry for r in results]}
+        data={'creator':'Lightroom preset batch conversion','presets':[r.preset_entry for r in results]}
         (out/'ALL_Converted_Lightroom_Presets.rrpreset').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
 
     # CSV report
     with open(out/'conversion_report.csv','w',newline='',encoding='utf-8-sig') as f:
         w=csv.writer(f,delimiter=';')
-        w.writerow(['Source','Preset','ProcessVersion','B&W','CameraProfile','Mapped','Approximate','Unsupported','Warnings'])
+        w.writerow(['Source','Format','Preset','ProcessVersion','B&W','CameraProfile','Mapped','Approximate','Unsupported','Warnings'])
         for r in results:
-            w.writerow([r.source,r.name,r.process_version,'yes' if r.is_bw else 'no',r.camera_profile,
+            w.writerow([r.source,pathlib.Path(r.source).suffix.lower().lstrip('.'),r.name,r.process_version,'yes' if r.is_bw else 'no',r.camera_profile,
                         ', '.join(sorted(set(r.mapped))),', '.join(sorted(set(r.approximate))),
                         ', '.join(sorted(set(r.unsupported))),' | '.join(r.warnings)])
-        for src,err in errors: w.writerow([src,'ERROR','','','','','','',err])
+        for src,err in errors: w.writerow([src,pathlib.Path(src).suffix.lower().lstrip('.'),'ERROR','','','','','','',err])
     profiles={}
     for r in results:
         if r.camera_profile: profiles[r.camera_profile]=profiles.get(r.camera_profile,0)+1
@@ -419,9 +585,10 @@ def convert_all(input_path:str, output_dir:str, template_path:Optional[str]=None
         'input':input_path,'converted':len(results),'errors':len(errors),
         'black_and_white':sum(r.is_bw for r in results),
         'presets_with_camera_profile':sum(bool(r.camera_profile) for r in results),
-        'unique_camera_profiles':profiles,
+        'unique_camera_profiles':profiles,'formats':dict(sorted(__import__('collections').Counter(pathlib.Path(r.source).suffix.lower().lstrip('.') for r in results).items())),
         'notes':[
             'Camera profiles (.dcp) are not embedded in .rrpreset.',
+            'Both legacy .lrtemplate and modern .xmp presets are supported.',
             'B&W fallback uses Saturation -100 plus GrayMixer -> HSL luminance.',
             'Legacy PV 5.x/older tone controls are approximate and are marked in conversion_report.csv.',
             'For best future compatibility, export a fresh simple RapidRAW preset and pass it with --template.'
@@ -437,14 +604,14 @@ def make_gui():
         from tkinter import ttk,filedialog,messagebox
     except Exception as e:
         print('Tkinter not available. Use CLI mode.'); return 2
-    root=tk.Tk(); root.title('Lightroom lrtemplate → RapidRAW Converter'); root.geometry('820x560')
+    root=tk.Tk(); root.title('Lightroom Presets → RapidRAW Converter'); root.geometry('820x560')
     frm=ttk.Frame(root,padding=12); frm.pack(fill='both',expand=True)
     inp=tk.StringVar(); out=tk.StringVar(); tmpl=tk.StringVar(); indiv=tk.BooleanVar(value=True); comb=tk.BooleanVar(value=True)
     def pick_input():
-        f=filedialog.askopenfilename(title='ZIP oder .lrtemplate wählen',filetypes=[('Lightroom/ZIP','*.zip *.lrtemplate'),('Alle Dateien','*.*')])
+        f=filedialog.askopenfilename(title='ZIP, .lrtemplate oder .xmp wählen',filetypes=[('Lightroom/ZIP','*.zip *.lrtemplate *.xmp'),('Alle Dateien','*.*')])
         if f: inp.set(f); out.set(str(pathlib.Path(f).with_name(pathlib.Path(f).stem+'_RapidRAW')))
     def pick_folder_input():
-        f=filedialog.askdirectory(title='Ordner mit .lrtemplate wählen')
+        f=filedialog.askdirectory(title='Ordner mit Lightroom-Presets wählen')
         if f: inp.set(f); out.set(str(pathlib.Path(f).with_name(pathlib.Path(f).name+'_RapidRAW')))
     def pick_out():
         f=filedialog.askdirectory(title='Ausgabeordner wählen')
@@ -452,12 +619,12 @@ def make_gui():
     def pick_tmpl():
         f=filedialog.askopenfilename(title='Optionales RapidRAW Referenz-Preset',filetypes=[('RapidRAW Preset','*.rrpreset'),('Alle Dateien','*.*')])
         if f: tmpl.set(f)
-    ttk.Label(frm,text='Lightroom → RapidRAW Batch Converter',font=('Segoe UI',15,'bold')).grid(row=0,column=0,columnspan=4,sticky='w',pady=(0,12))
+    ttk.Label(frm,text='Lightroom (.lrtemplate/.xmp) → RapidRAW Batch Converter',font=('Segoe UI',15,'bold')).grid(row=0,column=0,columnspan=4,sticky='w',pady=(0,12))
     ttk.Label(frm,text='Eingabe:').grid(row=1,column=0,sticky='w'); ttk.Entry(frm,textvariable=inp).grid(row=1,column=1,sticky='ew',padx=6)
     ttk.Button(frm,text='ZIP/Datei…',command=pick_input).grid(row=1,column=2); ttk.Button(frm,text='Ordner…',command=pick_folder_input).grid(row=1,column=3,padx=(6,0))
     ttk.Label(frm,text='Ausgabe:').grid(row=2,column=0,sticky='w',pady=6); ttk.Entry(frm,textvariable=out).grid(row=2,column=1,sticky='ew',padx=6); ttk.Button(frm,text='Ordner…',command=pick_out).grid(row=2,column=2)
     ttk.Label(frm,text='RapidRAW Vorlage:').grid(row=3,column=0,sticky='w'); ttk.Entry(frm,textvariable=tmpl).grid(row=3,column=1,sticky='ew',padx=6); ttk.Button(frm,text='Optional…',command=pick_tmpl).grid(row=3,column=2)
-    ttk.Label(frm,text='Leer = eingebautes Schema vom 22.08.2026. Bei späteren RapidRAW-Versionen einfach ein frisch exportiertes Test-Preset wählen.').grid(row=4,column=1,columnspan=3,sticky='w')
+    ttk.Label(frm,text='Leer = eingebautes RapidRAW-v1.6.2-Schema. Bei späteren RapidRAW-Versionen einfach ein frisch exportiertes Test-Preset wählen.').grid(row=4,column=1,columnspan=3,sticky='w')
     ttk.Checkbutton(frm,text='Einzelne .rrpreset + Ordnerstruktur erzeugen',variable=indiv).grid(row=5,column=1,columnspan=2,sticky='w',pady=(12,0))
     ttk.Checkbutton(frm,text='Zusätzlich eine Sammel-.rrpreset erzeugen',variable=comb).grid(row=6,column=1,columnspan=2,sticky='w')
     log=tk.Text(frm,height=18,wrap='word'); log.grid(row=8,column=0,columnspan=4,sticky='nsew',pady=(12,0))
@@ -483,8 +650,8 @@ def make_gui():
 def main(argv=None):
     argv=sys.argv[1:] if argv is None else argv
     if not argv: return make_gui()
-    ap=argparse.ArgumentParser(description='Batch convert legacy Lightroom .lrtemplate presets to RapidRAW .rrpreset')
-    ap.add_argument('input',help='.lrtemplate file, folder, or ZIP')
+    ap=argparse.ArgumentParser(description='Batch convert Lightroom .lrtemplate and .xmp presets to RapidRAW .rrpreset')
+    ap.add_argument('input',help='.lrtemplate/.xmp file, folder, or ZIP')
     ap.add_argument('-o','--output',default='RapidRAW_Converted',help='Output directory')
     ap.add_argument('--template',help='Optional fresh RapidRAW .rrpreset to use as schema/defaults')
     ap.add_argument('--no-individual',action='store_true',help='Do not write individual presets')
